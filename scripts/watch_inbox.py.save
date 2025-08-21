@@ -1,0 +1,114 @@
+import os
+import time
+import json
+import getpass
+from pathlib import Path
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding as sym_padding
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.backends import default_backend
+
+def load_private_key(path, passphrase):
+    with open(path, "rb") as f:
+        key_data = f.read()
+        return serialization.load_pem_private_key(key_data, password=passphrase.encode())
+
+def load_public_key(path):
+    with open(path, "rb") as f:
+        return serialization.load_pem_public_key(f.read())
+
+def decrypt_key(encrypted_key, private_key):
+    return private_key.decrypt(
+        encrypted_key,
+        asym_padding.OAEP(mgf=asym_padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+    )
+
+def decrypt_file(encrypted_data, aes_key, iv):
+    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded_data = decryptor.update(encrypted_data) + decryptor.finalize()
+    unpadder = sym_padding.PKCS7(128).unpadder()
+    return unpadder.update(padded_data) + unpadder.finalize()
+
+def verify_signature(data, signature, public_key):
+    digest = hashes.Hash(hashes.SHA256())
+    digest.update(data)
+    try:
+        public_key.verify(
+            signature,
+            digest.finalize(),
+            asym_padding.PSS(
+                mgf=asym_padding.MGF1(hashes.SHA256()),
+                salt_length=asym_padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return True
+    except InvalidSignature:
+        return False
+
+def process_inbox(receiver):
+    receiver_dir = Path("..") / "users" / receiver
+    inbox_dir = Path("..") / "messages" / f"to_{receiver}"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
+    priv_path = receiver_dir / "private_key.pem"
+    passphrase = getpass.getpass(f"[🔐] Enter passphrase for {receiver}'s private key: ")
+    receiver_priv = load_private_key(priv_path, passphrase)
+
+    seen = set()
+
+    print(f"[📬] Watching inbox: {inbox_dir}/")
+    while True:
+        files = list(inbox_dir.glob("*_metadata.json"))
+        for meta_file in files:
+            prefix = meta_file.name.replace("_metadata.json", "")
+            if prefix in seen:
+                continue
+            seen.add(prefix)
+
+            # Load metadata
+            with open(meta_file) as f:
+                metadata = json.load(f)
+
+            sender = metadata["sender"]
+            iv = bytes.fromhex(metadata["iv"])
+            original_filename = metadata["original_filename"]
+
+            try:
+                with open(inbox_dir / f"{prefix}_encrypted_key.bin", "rb") as f:
+                    encrypted_key = f.read()
+                with open(inbox_dir / f"{prefix}_encrypted_file.bin", "rb") as f:
+                    encrypted_data = f.read()
+                with open(inbox_dir / f"{prefix}_signature.bin", "rb") as f:
+                    signature = f.read()
+
+                aes_key = decrypt_key(encrypted_key, receiver_priv)
+                decrypted_data = decrypt_file(encrypted_data, aes_key, iv)
+
+                sender_pub = load_public_key(Path("..") / "users" / sender / "public_key.pem")
+                if verify_signature(decrypted_data, signature, sender_pub):
+                    from datetime import datetime
+log_dir = Path("..") / "logs"
+log_dir.mkdir(exist_ok=True)
+log_path = log_dir / f"{receiver}.log"
+with open(log_path, "a") as log_file:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_file.write(f"[{timestamp}] From: {sender} | File: {original_filename} | Status: VERIFIED\n")
+
+                    inbox = Path("..") / "inbox" / receiver
+                    inbox.mkdir(parents=True, exist_ok=True)
+                    out_path = inbox / f"{prefix}_{original_filename}"
+                    with open(out_path, "wb") as f:
+                        f.write(decrypted_data)
+                    print(f"[✓] Message from {sender} verified and saved: {out_path.name}")
+                else:
+                    print(f"[✗] Signature verification failed for {prefix}")
+            except Exception as e:
+                print(f"[✗] Failed to process {prefix}: {str(e)}")
+        time.sleep(3)  # Poll every 3 seconds
+
+if __name__ == "__main__":
+    username = input("Receiver username: ").strip().lower()
+    process_inbox(username)
